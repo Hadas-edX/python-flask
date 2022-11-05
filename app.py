@@ -1,27 +1,46 @@
 from flask import Flask, jsonify, request
 from flask_restful import Api, Resource
-import functools
 from pymongo import MongoClient
-from bcrypt import hashpw, gensalt, checkpw
+import bcrypt
+import functools
+import spacy
 
 print = functools.partial(print, flush=True)
 
 app = Flask(__name__)
 api = Api(app)
 
-client = MongoClient('mongodb://flask-db:27017')
-database = client.sentences
-users_collection = database['Users']
+client = MongoClient("mongodb://flask-db:27017")
+db = client .SimilarityDB
+users = db["Users"]
+
+nlp = spacy.load("./en_core_web_sm-3.0.0")
 
 
-def hash_password(password):
-    hashed_password = hashpw(password.encode('utf-8'), gensalt())
-    return hashed_password
+def userExists(username):
+    if len(list(users.find({'username': username}))) == 0:
+        return False
+    return True
 
 
-def verify_tokens(user_details):
-    tokens_num = user_details['tokens']
-    return tokens_num > 0
+def verifyPassword(username, password):
+    if not userExists(username):
+        return False
+    hashed = list(users.find({'username': username}))[0]['password']
+    if bcrypt.checkpw(password.encode('utf8'), hashed):
+        return True
+    return False
+
+
+def countTokens(username):
+    tokensNumber = list(users.find({'username': username}))[0]['tokens']
+    return tokensNumber
+
+
+def detectSimilarity(text1, text2):
+    doc1 = nlp(text1)
+    doc2 = nlp(text2)
+    return doc1.similarity(doc2)
 
 
 class Register(Resource):
@@ -29,108 +48,99 @@ class Register(Resource):
         postedData = request.get_json()
         username = postedData['username']
         password = postedData['password']
-        hashed_password = hash_password(password)
-        users_collection.insert_one({'username': username,
-                                     'password': hashed_password,
-                                     'sentences': [],
-                                     'tokens': 10
-                                     })
 
-        response = jsonify({
-            'Message': 'Registered Successfully!',
-            'statusCode': 200})
+        if userExists(username):
+            retJson = {
+                'status': 301,
+                'msg': 'Invalid username'
+            }
+            return jsonify(retJson)
 
-        return response
+        hashed_pw = bcrypt.hashpw(password.encode('utf8'), bcrypt.gensalt())
+        users.insert_one({
+            'username': username,
+            'password': hashed_pw,
+            'tokens': 6})
+
+        retJson = {
+            'status': 200,
+            'msg': 'You have successfully signed up'
+        }
+
+        return jsonify(retJson)
 
 
-class Store(Resource):
+class Detect(Resource):
     def post(self):
         postedData = request.get_json()
         username = postedData['username']
         password = postedData['password']
-        sentence = postedData['sentence']
+        text1 = postedData['text1']
+        text2 = postedData['text2']
 
-        user_details = users_collection.find_one({'username': username})
+        if not userExists(username):
+            retJson = {
+                'status': 301,
+                'msg': "Invalid username"
+            }
+            return jsonify(retJson)
 
-        hashed_user_password = user_details['password']
-        if checkpw(password.encode('utf-8'), hashed_user_password):
+        if not verifyPassword(username, password):
+            retJson = {
+                'status': 302,
+                'msg': 'Invalid password'
+            }
+            return jsonify(retJson)
 
-            enough_tokens = verify_tokens(user_details)
-            if enough_tokens:
+        if countTokens(username) < 1:
+            retJson = {
+                'status': 303,
+                'msg': 'Not enough tokens'
+            }
+            return jsonify(retJson)
 
-                user_sentences = user_details['sentences']
-                user_tokens = user_details['tokens'] - 1
-                user_sentences.append(sentence)
-                users_collection.update_one(
-                    {'username': username},
-                    {
-                        '$set': {
-                            'sentences': user_sentences,
-                            'tokens': user_tokens
-                        }
-                    }
-                )
+        users.update_one({'username': username}, {'$inc': {'tokens': -1}})
+        textSimilarity = detectSimilarity(text1, text2)
 
-                response = jsonify({
-                    'Message': 'Sentence saved successfully!',
-                    'statusCode': 200})
-            else:
-                response = jsonify({
-                    'Message': 'Not enough tokens',
-                    'statusCode': 400})
-
-        else:
-            response = jsonify({
-                'Message': 'Authentication failed',
-                'statusCode': 401})
-
-        return response
+        retJson = {
+            'status': 200,
+            'msg': 'The similarity between the texts is ' + str(textSimilarity)
+        }
+        return jsonify(retJson)
 
 
-class Get(Resource):
-    def get(self):
+class Refill(Resource):
+    def post(self):
         postedData = request.get_json()
         username = postedData['username']
-        password = postedData['password']
+        admin_password = postedData['admin_password']
+        refill_amount = postedData['refill_amount']
 
-        user_details = users_collection.find_one({'username': username})
+        if not userExists(username):
+            retJson = {
+                'status': 301,
+                'msg': 'Invalid username'
+            }
+            return jsonify(retJson)
 
-        hashed_user_password = user_details['password']
-        if checkpw(password.encode('utf-8'), hashed_user_password):
+        if not verifyPassword('admin', admin_password):
+            retJson = {
+                'status': 304,
+                'msg': 'Wrong admin password'
+            }
+            return jsonify(retJson)
 
-            enough_tokens = verify_tokens(user_details)
-            if enough_tokens:
-
-                user_sentences = user_details['sentences']
-                user_tokens = user_details['tokens'] - 1
-                users_collection.update_one(
-                    {'username': username},
-                    {
-                        '$set': {
-                            'tokens': user_tokens
-                        }
-                    }
-                )
-
-                response = jsonify({
-                    'Message': user_sentences,
-                    'statusCode': 200})
-            else:
-                response = jsonify({
-                    'Message': 'Not enough tokens',
-                    'statusCode': 400})
-
-        else:
-            response = jsonify({
-                'Message': 'Authentication failed',
-                'statusCode': 401})
-
-        return response
+        users.update_one({'username': username}, {'$set': {'tokens': refill_amount}})
+        retJson = {
+            'status': 200,
+            'msg': 'Tokens refilled successfully for user ' + username
+        }
+        return jsonify(retJson)
 
 
 api.add_resource(Register, '/register')
-api.add_resource(Store, '/store')
-api.add_resource(Get, '/get')
+api.add_resource(Detect, '/detect')
+api.add_resource(Refill, '/refill')
 
 
 if __name__ == "__main__":
